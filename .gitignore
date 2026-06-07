@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 datasets/
+runs/
+yolo26n.pt
+yolo26s.pt
