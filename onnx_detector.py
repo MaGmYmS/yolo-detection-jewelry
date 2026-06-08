@@ -9,10 +9,13 @@ ONNX Object Detection Inference
 
 Запуск:
     # Изображение
-    python onnx_detector.py --model model.onnx --input image.jpg --output result.jpg
+    python onnx_detector.py --model best.onnx --input hand.mp4 --imgsz 960
 
     # Видео
-    python onnx_detector.py --model model.onnx --input video.mp4 --output result.mp4
+    python onnx_detector.py --model best.onnx --input hand.png --imgsz 960
+
+    # Камера
+    python onnx_detector.py --model best.onnx --input 0 --imgsz 960
 
     # С дополнительными параметрами
     python onnx_detector.py --model model.onnx --input image.jpg \
@@ -144,18 +147,59 @@ def postprocess(
     scale: float,
     pad: tuple[int, int],
     orig_shape: tuple[int, int],
+    end2end: bool = False,
 ) -> list[dict]:
     """
     Обрабатывает сырой выход ONNX и возвращает список детекций.
 
-    Поддерживаются два формата выхода:
-      • [1, num_det, 5+num_classes]  — YOLO-стиль (cx,cy,w,h,obj*cls…)
-      • [1, 5+num_classes, num_det]  — транспонированный вариант
+    Поддерживаются три формата выхода:
+      • end2end=True: [1, num_det, 6] — (cx,cy,w,h, conf, class_id), NMS уже встроен
+      • [1, num_det, 5+num_classes]   — YOLO-стиль (cx,cy,w,h,obj, cls…), NMS применяется
+      • [1, 5+num_classes, num_det]   — транспонированный вариант, NMS применяется
 
     Каждая детекция: {'box': [x1,y1,x2,y2], 'score': float, 'class_id': int}
     """
-    pred = output[0]  # (N, 5+C) или (5+C, N)
+    pred = output[0]  # (N, 6) или (N, 5+C) или (5+C, N)
 
+    # ── end2end / NMS-free формат: (N, 6) = cx,cy,w,h,conf,class_id ───────
+    if end2end:
+        # Нормализуем к (N, 6)
+        if pred.ndim == 2 and pred.shape[0] < pred.shape[1]:
+            pred = pred.T
+
+        confidences = pred[:, 4]
+        class_ids = pred[:, 5].astype(int)
+        mask = confidences >= conf_threshold
+        if not mask.any():
+            return []
+
+        pred = pred[mask]
+        confidences = confidences[mask]
+        class_ids = class_ids[mask]
+
+        # cx,cy,w,h → x1,y1,x2,y2
+        boxes_raw = xywh2xyxy(pred[:, :4].copy())
+
+        pad_x, pad_y = pad
+        boxes_raw[:, [0, 2]] = (boxes_raw[:, [0, 2]] - pad_x) / scale
+        boxes_raw[:, [1, 3]] = (boxes_raw[:, [1, 3]] - pad_y) / scale
+
+        orig_h, orig_w = orig_shape
+        boxes_raw[:, [0, 2]] = boxes_raw[:, [0, 2]].clip(0, orig_w)
+        boxes_raw[:, [1, 3]] = boxes_raw[:, [1, 3]].clip(0, orig_h)
+
+        # NMS уже применён моделью — просто возвращаем
+        detections = []
+        for i in range(len(boxes_raw)):
+            x1, y1, x2, y2 = boxes_raw[i].astype(int)
+            detections.append({
+                "box": [x1, y1, x2, y2],
+                "score": float(confidences[i]),
+                "class_id": int(class_ids[i]),
+            })
+        return detections
+
+    # ── Стандартный YOLO-формат ─────────────────────────────────────────────
     # Нормализуем к форме (N, 5+C)
     if pred.ndim == 2 and pred.shape[0] < pred.shape[1]:
         pred = pred.T
@@ -164,9 +208,6 @@ def postprocess(
         return []
 
     num_classes = pred.shape[1] - 5
-    if num_classes <= 0:
-        # Формат без objectness: (x1,y1,x2,y2,score,class_id)
-        num_classes = 0
 
     # ── Фильтрация по уверенности ──────────────────────────────────────────
     if num_classes > 0:
@@ -286,23 +327,52 @@ class ONNXDetector:
         )
         self.session = ort.InferenceSession(model_path, providers=providers)
         self.input_name = self.session.get_inputs()[0].name
-        self.imgsz = imgsz
         self.conf = conf
         self.iou = iou
+
+        # ── Читаем метаданные модели (Ultralytics ONNX) ───────────────────
+        import ast
+        meta = dict(self.session.get_modelmeta().custom_metadata_map)
+        
+        # end2end: NMS уже встроен в модель
+        self.end2end = meta.get("end2end", "False").lower() in ("true", "1", "yes")
+
+        # imgsz из метаданных имеет приоритет над аргументом
+        if "imgsz" in meta:
+            try:
+                sz = ast.literal_eval(meta["imgsz"])
+                imgsz = sz[0] if isinstance(sz, (list, tuple)) else int(sz)
+            except Exception:
+                pass
+        self.imgsz = imgsz
+
+        # Имена классов из метаданных (если не переданы явно)
+        if not labels and "names" in meta:
+            try:
+                names = ast.literal_eval(meta["names"])
+                if isinstance(names, dict):
+                    labels = [names[i] for i in sorted(names)]
+                elif isinstance(names, list):
+                    labels = names
+            except Exception:
+                pass
+
         self.labels = labels or [str(i) for i in range(1000)]
-        self.colors = get_colors(len(self.labels))
+        self.colors = get_colors(max(len(self.labels), 1))
 
         inp = self.session.get_inputs()[0]
         print(f"[INFO] Модель загружена: {Path(model_path).name}")
         print(f"[INFO] Вход: {inp.name}  форма: {inp.shape}  тип: {inp.type}")
         print(f"[INFO] Провайдеры: {self.session.get_providers()}")
+        print(f"[INFO] imgsz={self.imgsz}  end2end={self.end2end}  классы: {self.labels}")
 
     def predict(self, frame: np.ndarray) -> list[dict]:
         """Выполняет инференс одного кадра (BGR numpy array)."""
         tensor, scale, pad = preprocess(frame, self.imgsz)
         outputs = self.session.run(None, {self.input_name: tensor})
         return postprocess(
-            outputs[0], self.conf, self.iou, scale, pad, frame.shape[:2]
+            outputs[0], self.conf, self.iou, scale, pad, frame.shape[:2],
+            end2end=self.end2end,
         )
 
     def visualize(self, frame: np.ndarray, detections: list[dict]) -> np.ndarray:
@@ -315,6 +385,34 @@ class ONNXDetector:
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".m4v"}
+
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 720
+
+
+def letterbox_image(img: np.ndarray, target_w: int, target_h: int,
+                    color: tuple = (0, 0, 0)) -> np.ndarray:
+    h, w = img.shape[:2]
+    scale = min(target_w / w, target_h / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((target_h, target_w, 3), color, dtype=np.uint8)
+    x_off = (target_w - new_w) // 2
+    y_off = (target_h - new_h) // 2
+    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return canvas
+
+
+def imshow_adaptive(win_name: str, img: np.ndarray) -> None:
+    target_w, target_h = WINDOW_WIDTH, WINDOW_HEIGHT
+    try:
+        rect = cv2.getWindowImageRect(win_name)
+        if rect[2] > 0 and rect[3] > 0:
+            target_w, target_h = rect[2], rect[3]
+    except:
+        pass
+    img = letterbox_image(img, target_w, target_h)
+    cv2.imshow(win_name, img)
 
 
 def process_image(detector: ONNXDetector, input_path: str, output_path: str | None):
@@ -339,9 +437,16 @@ def process_image(detector: ONNXDetector, input_path: str, output_path: str | No
         cv2.imwrite(output_path, vis)
         print(f"[INFO] Результат сохранён: {output_path}")
     else:
-        cv2.imshow("ONNX Detection", vis)
-        print("[INFO] Нажмите любую клавишу для закрытия...")
-        cv2.waitKey(0)
+        cv2.namedWindow("ONNX Detection", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("ONNX Detection", WINDOW_WIDTH, WINDOW_HEIGHT)
+        imshow_adaptive("ONNX Detection", vis)
+        print("[INFO] Нажмите любую клавишу или закройте окно для выхода...")
+        while True:
+            key = cv2.waitKey(1) & 0xFF
+            if key != 0xFF:
+                break
+            if cv2.getWindowProperty("ONNX Detection", cv2.WND_PROP_VISIBLE) < 1:
+                break
         cv2.destroyAllWindows()
 
 
@@ -371,6 +476,10 @@ def process_video(detector: ONNXDetector, input_path: str, output_path: str | No
     if output_size:
         print(f"[INFO] Размер выходного видео: {out_w}×{out_h}")
 
+    if not output_path:
+        cv2.namedWindow("ONNX Detection  (q — выход)", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("ONNX Detection  (q — выход)", WINDOW_WIDTH, WINDOW_HEIGHT)
+
     try:
         while True:
             ret, frame = cap.read()
@@ -392,8 +501,11 @@ def process_video(detector: ONNXDetector, input_path: str, output_path: str | No
             if writer:
                 writer.write(vis)
             else:
-                cv2.imshow("ONNX Detection  (q — выход)", vis)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                imshow_adaptive("ONNX Detection  (q — выход)", vis)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if cv2.getWindowProperty("ONNX Detection  (q — выход)", cv2.WND_PROP_VISIBLE) < 1:
                     break
 
             frame_idx += 1
